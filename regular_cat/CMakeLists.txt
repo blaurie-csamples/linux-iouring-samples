@@ -3,4 +3,4 @@ project(regular_cat C)
 
 set(CMAKE_C_STANDARD 23)
 
-add_executable(regular_cat main_readv.c)
+add_executable(regular_cat main.c)
