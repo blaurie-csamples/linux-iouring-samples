@@ -106,7 +106,7 @@ struct submitter {
 	int ring_fd;
 	struct app_io_sub_queue_ring sqr;
 	struct io_uring_sqe *sqes;
-	struct app_io_comp_queue_ring *cqr;
+	struct app_io_comp_queue_ring cqr;
 };
 
 struct file_info {
@@ -152,8 +152,8 @@ off_t get_file_size(int fd) {
  * This code will not use liburing for understanding purposes.
  */
 int app_setup_uring(struct submitter *s) {
-	struct app_io_sub_queue_ring *sring = &s->sqr;
-	struct app_io_comp_queue_ring *cring = &s->cqr;
+	struct app_io_sub_queue_ring *sring = &(s->sqr);
+	struct app_io_comp_queue_ring *cring = &(s->cqr);
 	struct io_uring_params p;
 	void *sq_ptr, *cq_ptr;
 
@@ -190,7 +190,7 @@ int app_setup_uring(struct submitter *s) {
 		cring_sz = sring_sz;
 	}
 	//newer kernels will map the submission and completion queue now
-	sq_ptr = mmap(0,sring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, s->ring_fd, IORING_OFF_SQ_RING);
+	sq_ptr = mmap(0, sring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, s->ring_fd, IORING_OFF_SQ_RING);
 	if (sq_ptr == MAP_FAILED) {
 		perror("mmap");
 		return 1;
@@ -200,14 +200,23 @@ int app_setup_uring(struct submitter *s) {
 		cq_ptr = sq_ptr;
 	} else {
 		//in older kernels, we map the cq ring separately
-		cq_ptr = mmap(0,cring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, s->ring_fd, IORING_OFF_CQ_RING);
+		cq_ptr = mmap(0, cring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, s->ring_fd, IORING_OFF_CQ_RING);
 		if (cq_ptr == MAP_FAILED) {
 			perror(("cq mmap"));
 			return 1;
 		}
 	}
 
-	//saving useful fields in a global for easy reference
+
+	// map submission queue entries array
+	s->sqes = mmap(0, p.sq_entries * sizeof(struct io_uring_sqe), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
+				   s->ring_fd, IORING_OFF_SQES);
+	if (s->sqes == MAP_FAILED) {
+		perror("mmap array");
+		return 1;
+	}
+
+	//saving useful fields in the submitter struct for easier reference later
 	sring->head = sq_ptr + p.sq_off.head;
 	sring->tail = sq_ptr + p.sq_off.tail;
 	sring->ring_mask = sq_ptr + p.sq_off.ring_mask;
@@ -215,13 +224,156 @@ int app_setup_uring(struct submitter *s) {
 	sring->flags = sq_ptr + p.sq_off.flags;
 	sring->array = sq_ptr + p.sq_off.array;
 
-	//180
+	cring->head = cq_ptr + p.cq_off.head;
+	cring->tail = cq_ptr + p.cq_off.tail;
+	cring->ring_mask = cq_ptr + p.cq_off.ring_mask;
+	cring->ring_mask = cq_ptr + p.cq_off.ring_entries;
+	cring->cqes = cq_ptr + p.cq_off.cqes;
 
-
+	return 0;
 }
 
+/*
+ * output a string of characters of len length to the stdout. Buffered output used for efficiency since this is
+ * character by character
+ */
+void output_to_console(char *buf, int len) {
+	while (len--) {
+		fputc(*buf++, stdout);
+	}
+}
 
+/*
+ * read completion events from the completion queue, get the data buffer that will have the file data and print it
+ * to the console
+ */
+void read_from_cq(struct submitter *s) {
+	struct file_info *fi;
+	struct app_io_comp_queue_ring *cring = &(s->cqr);
+	struct io_uring_cqe *cqe;
+	unsigned head, reaped = 0;
 
+	head = *(cring->head);
+
+	do {
+		read_barrier();
+
+		if (head == *(cring->tail)) {
+			break;
+		}
+
+		// get the entry
+		cqe = &(cring->cqes[head & *(s->cqr.ring_mask)]);
+		fi = (struct file_info*) cqe->user_data;
+		if (cqe->res < 0) {
+			fprintf(stderr, "Error: %s\n", strerror(abs(cqe->res)));
+		}
+
+		int blocks = (int) fi->file_sz / BLOCK_SZ;
+		if (fi->file_sz % BLOCK_SZ) blocks++;
+
+		for (int i = 0; i < blocks; i++) {
+			output_to_console(fi->iovecs[i].iov_base, fi->iovecs[i].iov_len);
+		}
+
+		head++;
+	} while (1);
+
+	*cring->head = head;
+	write_barrier();
+}
+
+/*
+ * Submit to submission queue. Can submit many types of requests, but these will be readv requests.
+ */
+int submit_to_sq(char *file_path, struct submitter *s) {
+	struct file_info *fi;
+
+	int file_fd = open(file_path, O_RDONLY);
+	if (file_fd < 0) {
+		perror("open");
+		return 1;
+	}
+
+	struct app_io_sub_queue_ring *sring = &(s->sqr);
+	unsigned index = 0, current_block = 0, tail = 0, next_tail = 0;
+
+	off_t file_sz = get_file_size(file_fd);
+	if (file_sz < 0) {
+		return 1;
+	}
+
+	off_t bytes_remaining = file_sz;
+	int blocks = (int) file_sz / BLOCK_SZ;
+	if (file_sz % BLOCK_SZ) blocks++;
+
+	//fi = malloc(sizeof(*fi) + sizeof(struct iovec) * blocks);
+	fi = malloc(sizeof(off_t) + sizeof(struct iovec) * blocks);
+	if (!fi) {
+		fprintf(stderr, "Unable to allocate memory\n");
+		return 1;
+	}
+	fi->file_sz = file_sz;
+
+	/*
+	 * need to allocate an iovec struct for each block that needs to be read.
+	 */
+	while (bytes_remaining) {
+		off_t bytes_to_read = bytes_remaining;
+		if (bytes_to_read > BLOCK_SZ) {
+			bytes_to_read = BLOCK_SZ;
+		}
+
+		fi->iovecs[current_block].iov_len = bytes_to_read;
+
+		void *buf;
+		if (posix_memalign(&buf, BLOCK_SZ, BLOCK_SZ)) {
+			perror("posix_memalign");
+			return 1;
+		}
+		fi->iovecs[current_block].iov_base = buf;
+
+		current_block++;
+		bytes_remaining -= bytes_to_read;
+	}
+
+	//add to the tail of the sqe ring buffer
+	next_tail = tail = *sring->tail;
+	next_tail++;
+	read_barrier();
+	index = tail & *s->sqr.ring_mask;
+	struct io_uring_sqe *sqe = &s->sqes[index];
+	sqe->fd = file_fd;
+	sqe->flags = 0;
+	sqe->opcode = IORING_OP_READV;
+	sqe->addr = (unsigned long) fi->iovecs;
+	sqe->len = blocks;
+	sqe->off = 0;
+	sqe->user_data = (unsigned long long) fi;
+	sring->array[index] = index;
+	tail = next_tail;
+
+	//update the tail so the kernel can see the sqe
+	if (*sring->tail != tail) {
+		*sring->tail = tail;
+		write_barrier();
+	}
+
+	/*
+	 * now let the kernel know we have events submitted using the io_uring_enter() system call. Also pass along the
+	 * IOURING_ENTER_GETEVENTS flag causing the io_uring_enter() call to wait until min_complete (3rd parameter)
+	 * events complete.
+	 */
+	int ret = io_uring_enter(s->ring_fd, 1, 1, IORING_ENTER_GETEVENTS);
+	if (ret < 0) {
+		perror("io_uring_enter");
+		return 1;
+	}
+
+	return 0;
+}
+
+//now main
 
 int main() {
 	printf("Hello, World!\n");
