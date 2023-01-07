@@ -120,7 +120,7 @@ int io_uring_setup(unsigned entries, struct io_uring_params *p) {
 }
 
 int io_uring_enter(int ring_fd, unsigned to_submit, unsigned min_complete, unsigned flags) {
-	return (int) syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete);
+	return (int) syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, NULL, 0);
 }
 
 /*
@@ -373,7 +373,7 @@ int submit_to_sq(char *file_path, struct submitter *s) {
 	return 0;
 }
 
-//now main
+
 
 int main(int argc, char *argv[]) {
 	struct submitter *s;
