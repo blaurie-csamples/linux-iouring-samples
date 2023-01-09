@@ -115,6 +115,18 @@ struct file_info {
 };
 
 /* roll your own syscalls while these are not part of the standard C libraries on linux */
+/* this is the io_uring_parms struct. You may only specify the flags before passing it.
+ * struct io_uring_params {
+ *  __u32 sq_entries;
+ *  __u32 cq_entries;
+ *  __u32 flags;
+ *  __u32 sq_thread_cpu;
+ *  __u32 sq_thread_idle;
+ *  __u32 resv[5];
+ *  struct io_sqring_offsets sq_off;
+ *  struct io_cqring_offsets cq_off;
+ * };
+ */
 int io_uring_setup(unsigned entries, struct io_uring_params *p) {
 	return (int) syscall(__NR_io_uring_setup, entries, p);
 }
